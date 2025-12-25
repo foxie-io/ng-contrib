@@ -15,7 +15,7 @@ func WithConfig(config *Config) ng.Option {
 
 // SkipRateLimit is used to skip rate limiting for a specific route.
 func SkipRateLimit() ng.Option {
-	return ng.WithSkip(ng.DefaultID[Guard]{})
+	return ng.WithSkip(defaultLimitGuardID{})
 }
 
 // GetConfig gets the rate limit config from context metadata.

@@ -71,18 +71,23 @@ type (
 
 	// Guard is the rate limiting middleware.
 	Guard struct {
+		defaultLimitGuardID
 		clients map[string]*clientData
 		mutex   sync.RWMutex
 		config  *Config
 	}
 )
 
+type defaultLimitGuardID struct {
+	ng.DefaultID[defaultLimitGuardID]
+}
+
 func (g *Guard) NgID() string {
-	if g.config.GuardSkipperID != nil {
-		return g.config.GuardSkipperID.NgID()
+	if g.config == nil || g.config.GuardSkipperID == nil {
+		return g.defaultLimitGuardID.NgID()
 	}
 
-	return "RATE_LIMIT_GUARD"
+	return g.config.GuardSkipperID.NgID()
 }
 
 // DefaultConfig provides default settings for the rate limiter.
