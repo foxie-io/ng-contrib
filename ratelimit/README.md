@@ -1,5 +1,12 @@
 Quick Start
 
+## Installation
+
+````bash
+go get github.com/foxie-io/ng-contrib/ratelimit
+
+```
+
 ```go
 
 
@@ -138,4 +145,4 @@ func (c *FreeTierController) OveriteLimitedAccess() ng.Route {
 
 
 
-```
+````
