@@ -8,75 +8,95 @@ import (
 	"time"
 
 	"github.com/foxie-io/ng"
+	"github.com/foxie-io/ng-contrib/ratelimit/limiter"
 )
 
-// Ensure Guard implements the required interfaces
 var _ interface {
 	ng.ID
 	ng.Guard
 } = (*Guard)(nil)
 
-type (
-	// Config holds the rate limit configuration.
-	Config struct {
-		// Limit is the maximum number of requests allowed in the window.
-		Limit int
+/* =========================
+   Config
+========================= */
 
-		// Window is the duration for which the rate limit applies.
-		Window time.Duration
+type Config struct {
 
-		// Identifier generates a unique identifier for the client making the request.
-		Identifier func(ctx context.Context) string
+	// Limit is the maximum number of requests allowed within the window.
+	Limit int
 
-		// ErrorHandler is called when the rate limit is exceeded.
-		ErrorHandler func(ctx context.Context) error
+	// Burst is the maximum burst size for token bucket algorithm.
+	Burst int
 
-		// SetHeaderHandler is called to set rate limit headers in the response.
-		SetHeaderHandler func(ctx context.Context, key, value string)
+	// Window is the rate limit window duration
+	Window time.Duration // rate limit window
 
-		// MetadataKey is the key used to store the config in route metadata.
-		MetadataKey string
+	// Identifier extracts client ID from context (e.g., IP, API key).
+	Identifier func(ctx context.Context) string
 
-		// GuardSkipperID is the ID used to identify routes that should skip this guard.
-		/*
-			type GlobalLimitId struct{
-				ng.DefaultID[GlobalLimitId]
-			}
+	// ErrorHandler is called when rate limit is exceeded.
+	ErrorHandler func(ctx context.Context) error
 
-			ratelimit.New(&ratelimit.Config{
-				// ...
-				GuardSkipperID: GlobalLimitId{},
-			})
+	// SetHeaderHandler sets rate limit headers (optional)
+	//	 key := "LIMIT", "REMAINING", "RESET", "BURST"
+	SetHeaderHandler func(ctx context.Context, key, value string)
 
-			ng.NewRoute(http.MethodGet, "/unlimited",
-				ng.Skip(GlobalLimitId{}), // skip rate limiting for this route
-				ng.WithHandler(...),
-			)
-		*/
-		GuardSkipperID ng.ID
+	// Optional metadata key for per-route config
+	MetadataKey string
+
+	// Optional Guard ID (for skipping)
+	GuardSkipperID ng.ID
+
+	// Algorithm specifies the rate limiting algorithm to use.
+	Algorithm limiter.Algorithm
+
+	// Store default is in-memory store
+	Store Store
+}
+
+/* =========================
+   Client state
+========================= */
+
+type clientData struct {
+	limiter limiter.Limiter
+}
+
+func newLimiter(cfg *Config, now time.Time) limiter.Limiter {
+	switch cfg.Algorithm {
+	case limiter.AlgorithmFixedWindow:
+		return &limiter.FixedWindow{
+			Limit:     cfg.Limit,
+			WindowDur: cfg.Window.Seconds(),
+			ResetAt:   now.Add(cfg.Window),
+		}
+	case limiter.AlgorithmSlidingWindow:
+		return &limiter.SlidingWindow{
+			Limit:     cfg.Limit,
+			WindowDur: cfg.Window.Seconds(),
+			Log:       []time.Time{},
+		}
+	default:
+		return &limiter.TokenBucket{
+			Rate:       float64(cfg.Limit) / cfg.Window.Seconds(),
+			Burst:      float64(cfg.Burst),
+			WindowDur:  cfg.Window.Seconds(),
+			Tokens:     float64(cfg.Burst),
+			LastRefill: now,
+		}
 	}
+}
 
-	// clientData holds the rate limit data for a specific client.
-	clientData struct {
+/* =========================
+   Guard
+========================= */
 
-		// reqs is the number of requests made by the client in the current window.
-		reqs int
-
-		// resetAt is the time when the rate limit window resets.
-		resetAt time.Time
-
-		// limit is the maximum number of requests allowed in the window.
-		limit int
-	}
-
-	// Guard is the rate limiting middleware.
-	Guard struct {
-		defaultLimitGuardID
-		clients map[string]*clientData
-		mutex   sync.RWMutex
-		config  *Config
-	}
-)
+type Guard struct {
+	defaultLimitGuardID
+	clients map[string]*clientData
+	mutex   sync.Mutex
+	config  *Config
+}
 
 type defaultLimitGuardID struct {
 	ng.DefaultID[defaultLimitGuardID]
@@ -86,14 +106,17 @@ func (g *Guard) NgID() string {
 	if g.config == nil || g.config.GuardSkipperID == nil {
 		return g.defaultLimitGuardID.NgID()
 	}
-
 	return g.config.GuardSkipperID.NgID()
 }
 
-// DefaultConfig provides default settings for the rate limiter.
+/* =========================
+   Defaults
+========================= */
+
 var DefaultConfig = &Config{
 	Limit:  100,
-	Window: time.Minute,
+	Burst:  20,
+	Window: time.Second,
 	Identifier: func(ctx context.Context) string {
 		return "default-client"
 	},
@@ -102,81 +125,78 @@ var DefaultConfig = &Config{
 	},
 }
 
-// New creates a new Guard instance
+/* =========================
+   Constructor
+========================= */
+
 func New(config *Config) *Guard {
 	if config == nil {
 		config = DefaultConfig
 	}
 
-	guard := &Guard{
-		config:  overrideOptional(config, DefaultConfig),
-		clients: make(map[string]*clientData),
+	config = overrideOptional(config, DefaultConfig)
+
+	// Provide default store if none provided
+	if config.Store == nil {
+		config.Store = NewInMemoryStore()
 	}
 
-	guard.startCleanup(time.Minute)
+	guard := &Guard{
+		config: config,
+	}
+
+	guard.startCleanup(2 * time.Minute)
 	return guard
 }
 
-// Allow checks if the request is allowed under the rate limit.
 func (g *Guard) Allow(ctx context.Context) error {
-	config := g.config
+	cfg := g.config
 
-	// Check if there is a route-specific rate limit configuration
-	if routeConfig, ok := GetConfig(ctx, config.MetadataKey); ok {
-		config = overrideOptional(routeConfig, g.config)
+	if routeCfg, ok := GetConfig(ctx, cfg.MetadataKey); ok {
+		cfg = overrideOptional(routeCfg, g.config)
 	}
 
-	// Generate a unique identifier for the client
-	id := config.Identifier(ctx)
-
-	// Lock the mutex to ensure thread-safe access to the clients map
-	g.mutex.Lock()
-	defer g.mutex.Unlock()
-
+	id := cfg.Identifier(ctx)
 	now := time.Now()
-	client, exists := g.clients[id]
 
-	// If the client does not exist or their rate limit window has expired, reset their data
-	if !exists || now.After(client.resetAt) {
-		client = &clientData{
-			limit:   config.Limit,
-			reqs:    1,
-			resetAt: now.Add(config.Window),
-		}
-		g.clients[id] = client
-	} else {
-		client.reqs++
+	// Get limiter from store
+	lim := cfg.Store.Get(id)
+	if lim == nil {
+		lim = newLimiter(cfg, now)
+		cfg.Store.Set(id, lim)
 	}
 
-	// Set rate limit headers
-	if config.SetHeaderHandler != nil {
-		remaining := client.limit - client.reqs
-		if remaining < 0 {
-			remaining = 0
-		}
-		config.SetHeaderHandler(ctx, "Limit", fmt.Sprintf("%d", client.limit))
-		config.SetHeaderHandler(ctx, "Remaining", fmt.Sprintf("%d", remaining))
-		config.SetHeaderHandler(ctx, "Reset", client.resetAt.Format(time.RFC3339))
+	allowed := lim.Allow(now)
+	remaining := lim.Remaining()
+
+	if !allowed {
+		return cfg.ErrorHandler(ctx)
 	}
 
-	hasReachedLimit := client.reqs > config.Limit
-	if hasReachedLimit {
-		client.reqs--
-		return config.ErrorHandler(ctx)
+	if cfg.SetHeaderHandler != nil {
+		cfg.SetHeaderHandler(ctx, "Limit", fmt.Sprintf("%d", cfg.Limit))
+		cfg.SetHeaderHandler(ctx, "Remaining", fmt.Sprintf("%d", remaining))
+		resetTime := time.Now().Add(lim.Window())
+		cfg.SetHeaderHandler(ctx, "Reset", resetTime.Format(time.RFC3339))
+
+		// Optional burst info for token bucket
+		if tb, ok := lim.(*limiter.TokenBucket); ok {
+			cfg.SetHeaderHandler(ctx, "Burst", fmt.Sprintf("%d", int(tb.Burst)))
+		}
 	}
 
 	return nil
 }
 
-// cleanupExpiredClients removes clients whose rate limit window has expired
 func (g *Guard) cleanupExpiredClients() {
-	g.mutex.Lock()
-	defer g.mutex.Unlock()
-
 	now := time.Now()
-	for id, client := range g.clients {
-		if now.After(client.resetAt) {
-			delete(g.clients, id)
+	for _, id := range g.config.Store.Keys() {
+		lim := g.config.Store.Get(id)
+		if lim == nil || lim.Window() == 0 {
+			continue
+		}
+		if now.Sub(lim.LastSeen()) > 2*lim.Window() {
+			g.config.Store.Delete(id)
 		}
 	}
 }
@@ -191,34 +211,40 @@ func (g *Guard) startCleanup(interval time.Duration) {
 	}()
 }
 
-func overrideOptional(config *Config, defaultConfig *Config) *Config {
+/* =========================
+   Helpers
+========================= */
+
+func overrideOptional(config, def *Config) *Config {
 	if config == nil {
-		return defaultConfig
+		return def
 	}
-
 	if config.Limit == 0 {
-		config.Limit = defaultConfig.Limit
+		config.Limit = def.Limit
 	}
-
+	if config.Burst == 0 {
+		config.Burst = def.Burst
+	}
 	if config.Window == 0 {
-		config.Window = defaultConfig.Window
+		config.Window = def.Window
 	}
-
 	if config.Identifier == nil {
-		config.Identifier = defaultConfig.Identifier
+		config.Identifier = def.Identifier
 	}
-
 	if config.ErrorHandler == nil {
-		config.ErrorHandler = defaultConfig.ErrorHandler
+		config.ErrorHandler = def.ErrorHandler
 	}
-
-	if config.MetadataKey == "" {
-		config.MetadataKey = defaultConfig.MetadataKey
-	}
-
 	if config.SetHeaderHandler == nil {
-		config.SetHeaderHandler = defaultConfig.SetHeaderHandler
+		config.SetHeaderHandler = def.SetHeaderHandler
 	}
-
+	if config.MetadataKey == "" {
+		config.MetadataKey = def.MetadataKey
+	}
+	if config.Algorithm == "" {
+		config.Algorithm = def.Algorithm
+	}
+	if config.Store == nil {
+		config.Store = def.Store
+	}
 	return config
 }

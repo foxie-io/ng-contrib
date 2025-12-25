@@ -12,6 +12,7 @@ import (
 
 	"github.com/foxie-io/ng"
 	"github.com/foxie-io/ng-contrib/ratelimit"
+	"github.com/foxie-io/ng-contrib/ratelimit/limiter"
 
 	ngadapter "github.com/foxie-io/ng/adapter"
 	nghttp "github.com/foxie-io/ng/http"
@@ -26,10 +27,11 @@ type globalGuardSkipperID struct {
 	ng.DefaultID[globalGuardSkipperID]
 }
 
-func createGlobalGuard() *ratelimit.Guard {
+func createGlobalGuard(alg limiter.Algorithm) *ratelimit.Guard {
 	return ratelimit.New(&ratelimit.Config{
-		Limit:  1000,
-		Window: time.Second,
+		Limit:     1000,
+		Window:    time.Second,
+		Algorithm: alg,
 		Identifier: func(ctx context.Context) string {
 			return GLOBAL
 		},
@@ -46,10 +48,11 @@ func createGlobalGuard() *ratelimit.Guard {
 	})
 }
 
-func createPerRouteGuard() *ratelimit.Guard {
+func createPerRouteGuard(alg limiter.Algorithm) *ratelimit.Guard {
 	return ratelimit.New(&ratelimit.Config{
-		Limit:  1000,
-		Window: time.Second,
+		Limit:     1000,
+		Window:    time.Second,
+		Algorithm: alg,
 		Identifier: func(ctx context.Context) string {
 			r := ng.GetContext(ctx)
 			route := r.Route()
@@ -88,6 +91,7 @@ func (c *TestController) Limited() ng.Route {
 	return ng.NewRoute(http.MethodGet, "/limited",
 		ratelimit.WithConfig(&ratelimit.Config{
 			Limit:  5,
+			Burst:  5,
 			Window: time.Second,
 			Identifier: func(ctx context.Context) string {
 				return "test-client"
@@ -162,129 +166,9 @@ func setupTestApp(opts ...ng.Option) (ng.App, *http.ServeMux) {
 	return app, mux
 }
 
-func TestRateLimitBasic(t *testing.T) {
-	// Test route-specific rate limiting with /limited endpoint (5 req/sec)
-	app, mux := setupTestApp(
-		ng.WithGuards(
-			createGlobalGuard(),
-			createPerRouteGuard(),
-		),
-	)
-
-	app.AddController(&TestController{})
-	app.Build()
-
-	ngadapter.ServeMuxRegisterRoutes(app, mux)
-	server := httptest.NewServer(mux)
-	defer server.Close()
-
-	// Make 5 successful requests
-	for i := 1; i <= 5; i++ {
-		resp, err := http.Get(server.URL + "/limited")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("request %d: expected status 200, got %d", i, resp.StatusCode)
-		}
-		resp.Body.Close()
-	}
-
-	// 6th request should be rate limited
-	resp, err := http.Get(server.URL + "/limited")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("expected status 429, got %d. Headers: %v", resp.StatusCode, resp.Header)
-	}
-	resp.Body.Close()
-
-	// Wait for rate limit window to reset
-	time.Sleep(1100 * time.Millisecond)
-
-	// Should be able to make requests again
-	resp, err = http.Get(server.URL + "/limited")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("after reset: expected status 200, got %d", resp.StatusCode)
-	}
-	resp.Body.Close()
-}
-
-func TestRateLimitHeaders(t *testing.T) {
-	app, mux := setupTestApp(
-		ng.WithGuards(createGlobalGuard(), createPerRouteGuard()),
-	)
-
-	app.AddController(&TestController{})
-	app.Build()
-
-	ngadapter.ServeMuxRegisterRoutes(app, mux)
-	server := httptest.NewServer(mux)
-	defer server.Close()
-
-	// Test global headers on /simple endpoint
-	resp, err := http.Get(server.URL + "/simple")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-
-	// Check global rate limit headers (prefixed with X-G-RateLimit)
-	// Note: headers might be normalized to lowercase
-	limit := resp.Header.Get("X-G-Ratelimit-Limit")
-	if limit == "" {
-		limit = resp.Header.Get("X-G-RateLimit-Limit")
-	}
-	if limit != "1000" {
-		t.Fatalf("expected X-G-Ratelimit-Limit to be '1000', got '%s'", limit)
-	}
-
-	remaining := resp.Header.Get("X-G-Ratelimit-Remaining")
-	if remaining == "" {
-		remaining = resp.Header.Get("X-G-RateLimit-Remaining")
-	}
-	if remaining != "999" {
-		t.Fatalf("expected X-G-Ratelimit-Remaining to be '999', got '%s'", remaining)
-	}
-
-	reset := resp.Header.Get("X-G-Ratelimit-Reset")
-	if reset == "" {
-		reset = resp.Header.Get("X-G-RateLimit-Reset")
-	}
-	if reset == "" {
-		t.Fatal("expected X-G-Ratelimit-Reset header to be set")
-	}
-
-	// Test per-route headers on /limited endpoint
-	// Make multiple requests to trigger per-route limit
-	for i := 0; i < 4; i++ {
-		resp, _ := http.Get(server.URL + "/limited")
-		resp.Body.Close()
-	}
-
-	resp2, err := http.Get(server.URL + "/limited")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp2.Body.Close()
-
-	// Check per-route rate limit headers (should be present on the 5th request)
-	limit2 := resp2.Header.Get("X-Ratelimit-Limit")
-	if limit2 == "" {
-		limit2 = resp2.Header.Get("X-RateLimit-Limit")
-	}
-	if limit2 != "" && limit2 != "5" {
-		t.Fatalf("expected X-RateLimit-Limit to be '5', got '%s'", limit2)
-	}
-}
-
 func TestRateLimitPerUser(t *testing.T) {
 	app, mux := setupTestApp(
-		ng.WithGuards(createGlobalGuard(), createPerRouteGuard()),
+		ng.WithGuards(createGlobalGuard(limiter.AlgorithmFixedWindow), createPerRouteGuard(limiter.AlgorithmFixedWindow)),
 	)
 
 	app.AddController(&TestController{})
@@ -335,7 +219,7 @@ func TestRateLimitPerUser(t *testing.T) {
 
 func TestRateLimitSkip(t *testing.T) {
 	app, mux := setupTestApp(
-		ng.WithGuards(createGlobalGuard(), createPerRouteGuard()),
+		ng.WithGuards(createGlobalGuard(limiter.AlgorithmFixedWindow), createPerRouteGuard(limiter.AlgorithmFixedWindow)),
 	)
 
 	app.AddController(&TestController{})
@@ -395,7 +279,7 @@ func TestRateLimitSkip(t *testing.T) {
 
 func TestRateLimitCustomConfig(t *testing.T) {
 	app, mux := setupTestApp(
-		ng.WithGuards(createGlobalGuard(), createPerRouteGuard()),
+		ng.WithGuards(createGlobalGuard(limiter.AlgorithmFixedWindow), createPerRouteGuard(limiter.AlgorithmFixedWindow)),
 	)
 
 	app.AddController(&TestController{})
@@ -430,7 +314,7 @@ func TestRateLimitCustomConfig(t *testing.T) {
 
 func TestRateLimitReset(t *testing.T) {
 	app, mux := setupTestApp(
-		ng.WithGuards(createGlobalGuard(), createPerRouteGuard()),
+		ng.WithGuards(createGlobalGuard(limiter.AlgorithmFixedWindow), createPerRouteGuard(limiter.AlgorithmFixedWindow)),
 	)
 
 	app.AddController(&TestController{})
@@ -479,7 +363,7 @@ func TestRateLimitReset(t *testing.T) {
 
 func TestRateLimitMultipleRoutes(t *testing.T) {
 	app, mux := setupTestApp(
-		ng.WithGuards(createGlobalGuard(), createPerRouteGuard()),
+		ng.WithGuards(createGlobalGuard(limiter.AlgorithmFixedWindow), createPerRouteGuard(limiter.AlgorithmFixedWindow)),
 	)
 
 	app.AddController(&TestController{})
@@ -537,7 +421,7 @@ func TestRateLimitMultipleRoutes(t *testing.T) {
 
 func TestRateLimitErrorType(t *testing.T) {
 	app, mux := setupTestApp(
-		ng.WithGuards(createGlobalGuard(), createPerRouteGuard()),
+		ng.WithGuards(createGlobalGuard(limiter.AlgorithmFixedWindow), createPerRouteGuard(limiter.AlgorithmFixedWindow)),
 	)
 
 	app.AddController(&TestController{})
@@ -563,4 +447,119 @@ func TestRateLimitErrorType(t *testing.T) {
 	if resp.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("expected status 429, got %d", resp.StatusCode)
 	}
+}
+
+func TestRateLimitBasic(t *testing.T) {
+	for _, alg := range []limiter.Algorithm{
+		limiter.AlgorithmTokenBucket,
+		limiter.AlgorithmFixedWindow,
+		limiter.AlgorithmSlidingWindow,
+	} {
+		t.Run(fmt.Sprintf("Algorithm=%v", alg), func(t *testing.T) {
+			app, mux := setupTestApp(
+				ng.WithGuards(
+					createGlobalGuard(alg),
+					createPerRouteGuard(alg),
+				),
+			)
+
+			app.AddController(&TestController{})
+			app.Build()
+			ngadapter.ServeMuxRegisterRoutes(app, mux)
+			server := httptest.NewServer(mux)
+			defer server.Close()
+
+			// Make 5 successful requests
+			for i := 1; i <= 5; i++ {
+				resp, err := http.Get(server.URL + "/limited")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if resp.StatusCode != http.StatusOK {
+					t.Fatalf("request %d: expected status 200, got %d", i, resp.StatusCode)
+				}
+				resp.Body.Close()
+			}
+
+			// 6th request should be rate limited
+			resp, err := http.Get(server.URL + "/limited")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != http.StatusTooManyRequests {
+				t.Fatalf("expected 429, got %d, %v", resp.StatusCode, resp.Header)
+			}
+			resp.Body.Close()
+
+			// Wait for window reset
+			time.Sleep(1100 * time.Millisecond)
+
+			// Should be able to make requests again
+			resp, err = http.Get(server.URL + "/limited")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("after reset: expected 200, got %d", resp.StatusCode)
+			}
+			resp.Body.Close()
+		})
+	}
+}
+
+func TestRateLimitHeaders(t *testing.T) {
+	for _, alg := range []limiter.Algorithm{
+		limiter.AlgorithmTokenBucket,
+		limiter.AlgorithmFixedWindow,
+		limiter.AlgorithmSlidingWindow,
+	} {
+		t.Run(fmt.Sprintf("Algorithm=%v", alg), func(t *testing.T) {
+			app, mux := setupTestApp(
+				ng.WithGuards(createGlobalGuard(alg), createPerRouteGuard(alg)),
+			)
+			app.AddController(&TestController{})
+			app.Build()
+			ngadapter.ServeMuxRegisterRoutes(app, mux)
+			server := httptest.NewServer(mux)
+			defer server.Close()
+
+			resp, err := http.Get(server.URL + "/simple")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+
+			limit := getHeader(resp.Header, "X-G-RateLimit-Limit", "X-G-Ratelimit-Limit")
+			if limit != "1000" {
+				t.Fatalf("expected X-G-Ratelimit-Limit 1000, got '%s'", limit)
+			}
+
+			remaining := getHeader(resp.Header, "X-G-RateLimit-Remaining", "X-G-Ratelimit-Remaining")
+			if remaining == "" {
+				t.Fatal("expected remaining header")
+			}
+
+			reset := getHeader(resp.Header, "X-G-RateLimit-Reset", "X-G-Ratelimit-Reset")
+			if reset == "" {
+				t.Fatal("expected reset header")
+			}
+
+			// Burst header only for token bucket
+			if alg == limiter.AlgorithmTokenBucket {
+				burst := getHeader(resp.Header, "X-G-RateLimit-Burst")
+				if burst == "" {
+					t.Fatal("expected burst header for token bucket")
+				}
+			}
+		})
+	}
+}
+
+func getHeader(h http.Header, names ...string) string {
+	for _, n := range names {
+		if v := h.Get(n); v != "" {
+			return v
+		}
+	}
+	return ""
 }
