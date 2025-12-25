@@ -12,7 +12,7 @@ Think of it as `fiber-contrib` but for `ng`.
 
 ## Features
 
-- **Rate Limiting ([ratelimit package](https://pkg.go.dev/github.com/foxie-io/ng-contrib/ratelimit))**
+- **Rate Limiting ([ratelimit package](https://github.com/foxie-io/ng-contrib/blob/main/ratelimit/README.md))**
   - Token Bucket
   - Fixed Window
   - Sliding Window
